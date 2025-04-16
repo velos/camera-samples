@@ -37,6 +37,7 @@
             android:name="com.example.android.camerax.tflite.CameraActivity"
             android:rotationAnimation="seamless"
             android:exported="true"
+            android:screenOrientation="portrait"
             tools:targetApi="O">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN"/>

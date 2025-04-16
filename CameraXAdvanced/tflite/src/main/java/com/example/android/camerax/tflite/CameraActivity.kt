@@ -28,6 +28,7 @@ import android.util.Log
 import android.util.Size
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewGroup.MarginLayoutParams
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.AspectRatio
 import androidx.camera.core.CameraSelector
@@ -36,20 +37,20 @@ import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.view.updateLayoutParams
 import androidx.lifecycle.LifecycleOwner
 import com.android.example.camerax.tflite.databinding.ActivityCameraBinding
-import org.tensorflow.lite.DataType
-import org.tensorflow.lite.Interpreter
-import org.tensorflow.lite.nnapi.NnApiDelegate
-import org.tensorflow.lite.support.common.FileUtil
-import org.tensorflow.lite.support.common.ops.NormalizeOp
-import org.tensorflow.lite.support.image.ImageProcessor
-import org.tensorflow.lite.support.image.TensorImage
-import org.tensorflow.lite.support.image.ops.ResizeOp
-import org.tensorflow.lite.support.image.ops.ResizeWithCropOrPadOp
-import org.tensorflow.lite.support.image.ops.Rot90Op
+import com.google.mediapipe.framework.image.BitmapImageBuilder
+import com.google.mediapipe.framework.image.ByteBufferExtractor
+import com.google.mediapipe.tasks.components.containers.NormalizedKeypoint
+import com.google.mediapipe.tasks.core.BaseOptions
+import com.google.mediapipe.tasks.core.Delegate
+import com.google.mediapipe.tasks.vision.interactivesegmenter.InteractiveSegmenter
+import com.google.mediapipe.tasks.vision.interactivesegmenter.InteractiveSegmenter.RegionOfInterest
+import org.opencv.android.OpenCVLoader
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import kotlin.jvm.optionals.getOrNull
 import kotlin.math.min
 import kotlin.random.Random
 
@@ -70,43 +71,34 @@ class CameraActivity : AppCompatActivity() {
 
     private var pauseAnalysis = false
     private var imageRotationDegrees: Int = 0
-    private val tfImageBuffer = TensorImage(DataType.UINT8)
 
-    private val tfImageProcessor by lazy {
-        val cropSize = minOf(bitmapBuffer.width, bitmapBuffer.height)
-        ImageProcessor.Builder()
-            .add(ResizeWithCropOrPadOp(cropSize, cropSize))
-            .add(ResizeOp(
-                tfInputSize.height, tfInputSize.width, ResizeOp.ResizeMethod.NEAREST_NEIGHBOR))
-            .add(Rot90Op(-imageRotationDegrees / 90))
-            .add(NormalizeOp(0f, 1f))
-            .build()
-    }
+    private val imageSegmenter: InteractiveSegmenter by lazy {
+        val imageSegmenterOptions =
+            InteractiveSegmenter.InteractiveSegmenterOptions
+                .builder()
+                .setBaseOptions(
+                    BaseOptions
+                        .builder()
+                        .setDelegate(Delegate.CPU)
+                        .setModelAssetPath("magic_touch.tflite")
+                        .build(),
+                ).setOutputCategoryMask(true)
+                .setOutputConfidenceMasks(false)
+                .build()
 
-    private val nnApiDelegate by lazy  {
-        NnApiDelegate()
+        InteractiveSegmenter.createFromOptions(this, imageSegmenterOptions)
     }
-
-    private val tflite by lazy {
-        Interpreter(
-            FileUtil.loadMappedFile(this, MODEL_PATH),
-            Interpreter.Options().addDelegate(nnApiDelegate))
-    }
-    private val detector by lazy {
-        ObjectDetectionHelper(
-            tflite,
-            FileUtil.loadLabels(this, LABELS_PATH)
-        )
-    }
-
-    private val tfInputSize by lazy {
-        val inputIndex = 0
-        val inputShape = tflite.getInputTensor(inputIndex).shape()
-        Size(inputShape[2], inputShape[1]) // Order of axis is: {1, height, width, 3}
-    }
+    private val openCvDocumentDetector: OpenCvDocumentDetector = OpenCvDocumentDetector()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        if (savedInstanceState == null) {
+            OpenCVLoader.initLocal()
+        }
+
+        openCvDocumentDetector.initialize()
+
         activityCameraBinding = ActivityCameraBinding.inflate(layoutInflater)
         setContentView(activityCameraBinding.root)
 
@@ -146,9 +138,10 @@ class CameraActivity : AppCompatActivity() {
             awaitTermination(1000, TimeUnit.MILLISECONDS)
         }
 
+        openCvDocumentDetector.release()
+
         // Release TFLite resources.
-        tflite.close()
-        nnApiDelegate.close()
+//        imageSegmenter.close()
 
         super.onDestroy()
     }
@@ -199,13 +192,10 @@ class CameraActivity : AppCompatActivity() {
                 image.use { bitmapBuffer.copyPixelsFromBuffer(image.planes[0].buffer)  }
 
                 // Process the image in Tensorflow
-                val tfImage =  tfImageProcessor.process(tfImageBuffer.apply { load(bitmapBuffer) })
-
-                // Perform the object detection for the current frame
-                val predictions = detector.predict(tfImage)
+                val predictionLocation = segmentImage(bitmapBuffer.rotate(imageRotationDegrees))
 
                 // Report only the top prediction
-                reportPrediction(predictions.maxByOrNull { it.score })
+                reportPrediction(predictionLocation)
 
                 // Compute the FPS of the entire pipeline
                 val frameCount = 10
@@ -214,7 +204,7 @@ class CameraActivity : AppCompatActivity() {
                     val now = System.currentTimeMillis()
                     val delta = now - lastFpsTimestamp
                     val fps = 1000 * frameCount.toFloat() / delta
-                    Log.d(TAG, "FPS: ${"%.02f".format(fps)} with tensorSize: ${tfImage.width} x ${tfImage.height}")
+                    Log.d(TAG, "FPS: ${"%.02f".format(fps)} with tensorSize: ${bitmapBuffer.width} x ${bitmapBuffer.height}")
                     lastFpsTimestamp = now
                 }
             })
@@ -233,32 +223,91 @@ class CameraActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
+    fun Bitmap.rotate(rotation: Int): Bitmap {
+        if (rotation == 0) return this
+
+        val matrix = Matrix()
+        matrix.postRotate(rotation.toFloat())
+        return Bitmap.createBitmap(this, 0, 0, width, height, matrix, false)
+    }
+
+    private fun segmentImage(bitmap: Bitmap): RectF? {
+        val roi =
+            RegionOfInterest.create(
+                NormalizedKeypoint.create(
+                    0.5f * bitmap.width,
+                    0.5f * bitmap.height,
+                ),
+            )
+
+        val mpImage = BitmapImageBuilder(bitmap).build()
+
+        return imageSegmenter
+            .segment(mpImage, roi)
+            ?.categoryMask()
+            ?.getOrNull()
+            ?.let { segmentationResult ->
+                val byteBuffer = ByteBufferExtractor.extract(segmentationResult)
+
+                val foregroundMask = ByteArray(byteBuffer.capacity())
+                byteBuffer.get(foregroundMask)
+                for (i in foregroundMask.indices) {
+                    foregroundMask[i] =
+                        if (foregroundMask[i] < 0) {
+                            0
+                        } else {
+                            -1 // Byte(-1) = Int(255)
+                        }
+                }
+
+                val contourPoints =
+                    openCvDocumentDetector.detect(
+                        foregroundMask,
+                        bitmap.width,
+                        bitmap.height,
+                    )
+
+                if (contourPoints.size == 4) {
+                    RectF(
+                        contourPoints[0].x.toFloat() / bitmap.width,
+                        contourPoints[0].y.toFloat() / bitmap.height,
+                        contourPoints[2].x.toFloat() / bitmap.width,
+                        contourPoints[2].y.toFloat() / bitmap.height,
+                    )
+                        .also {
+                            Log.d("carlos", "contourPoints: $contourPoints ${bitmap.width} x ${bitmap.height}")
+                        }
+                } else {
+                    null
+                }
+            }
+    }
+
     private fun reportPrediction(
-        prediction: ObjectDetectionHelper.ObjectPrediction?
+        predictionLocation: RectF?
     ) = activityCameraBinding.viewFinder.post {
 
         // Early exit: if prediction is not good enough, don't report it
-        if (prediction == null || prediction.score < ACCURACY_THRESHOLD) {
+        if (predictionLocation == null) {
             activityCameraBinding.boxPrediction.visibility = View.GONE
-            activityCameraBinding.textPrediction.visibility = View.GONE
             return@post
         }
 
         // Location has to be mapped to our local coordinates
-        val location = mapOutputCoordinates(prediction.location)
+        val location = mapOutputCoordinates(predictionLocation)
 
         // Update the text and UI
-        activityCameraBinding.textPrediction.text = "${"%.2f".format(prediction.score)} ${prediction.label}"
-        (activityCameraBinding.boxPrediction.layoutParams as ViewGroup.MarginLayoutParams).apply {
+        activityCameraBinding.boxPrediction.updateLayoutParams<MarginLayoutParams> {
             topMargin = location.top.toInt()
             leftMargin = location.left.toInt()
+//            bottomMargin = activityCameraBinding.viewFinder.height - location.bottom.toInt()
+//            rightMargin = activityCameraBinding.viewFinder.width - location.right.toInt()
             width = min(activityCameraBinding.viewFinder.width, location.right.toInt() - location.left.toInt())
             height = min(activityCameraBinding.viewFinder.height, location.bottom.toInt() - location.top.toInt())
         }
 
         // Make sure all UI elements are visible
         activityCameraBinding.boxPrediction.visibility = View.VISIBLE
-        activityCameraBinding.textPrediction.visibility = View.VISIBLE
     }
 
     /**
@@ -268,45 +317,28 @@ class CameraActivity : AppCompatActivity() {
     private fun mapOutputCoordinates(location: RectF): RectF {
 
         // Step 1: map location to the preview coordinates
-        val previewLocation = RectF(
+        val correctedLocation = RectF(
             location.left * activityCameraBinding.viewFinder.width,
             location.top * activityCameraBinding.viewFinder.height,
             location.right * activityCameraBinding.viewFinder.width,
             location.bottom * activityCameraBinding.viewFinder.height
         )
 
-        // Step 2: compensate for camera sensor orientation and mirroring
-        val isFrontFacing = lensFacing == CameraSelector.LENS_FACING_FRONT
-        val correctedLocation = if (isFrontFacing) {
-            RectF(
-                activityCameraBinding.viewFinder.width - previewLocation.right,
-                previewLocation.top,
-                activityCameraBinding.viewFinder.width - previewLocation.left,
-                previewLocation.bottom)
-        } else {
-            previewLocation
-        }
+        Log.d("carlos", "${activityCameraBinding.viewFinder.width} x ${activityCameraBinding.viewFinder.height}")
+
+//        return correctedLocation
 
         // Step 3: compensate for 1:1 to 4:3 aspect ratio conversion + small margin
         val margin = 0.1f
         val requestedRatio = 4f / 3f
         val midX = (correctedLocation.left + correctedLocation.right) / 2f
         val midY = (correctedLocation.top + correctedLocation.bottom) / 2f
-        return if (activityCameraBinding.viewFinder.width < activityCameraBinding.viewFinder.height) {
-            RectF(
+        return RectF(
                 midX - (1f + margin) * requestedRatio * correctedLocation.width() / 2f,
                 midY - (1f - margin) * correctedLocation.height() / 2f,
                 midX + (1f + margin) * requestedRatio * correctedLocation.width() / 2f,
                 midY + (1f - margin) * correctedLocation.height() / 2f
             )
-        } else {
-            RectF(
-                midX - (1f - margin) * correctedLocation.width() / 2f,
-                midY - (1f + margin) * requestedRatio * correctedLocation.height() / 2f,
-                midX + (1f - margin) * correctedLocation.width() / 2f,
-                midY + (1f + margin) * requestedRatio * correctedLocation.height() / 2f
-            )
-        }
     }
 
     override fun onResume() {
@@ -341,9 +373,5 @@ class CameraActivity : AppCompatActivity() {
 
     companion object {
         private val TAG = CameraActivity::class.java.simpleName
-
-        private const val ACCURACY_THRESHOLD = 0.5f
-        private const val MODEL_PATH = "coco_ssd_mobilenet_v1_1.0_quant.tflite"
-        private const val LABELS_PATH = "coco_ssd_mobilenet_v1_1.0_labels.txt"
     }
 }
