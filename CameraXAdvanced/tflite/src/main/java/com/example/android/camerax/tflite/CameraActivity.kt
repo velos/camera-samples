@@ -25,9 +25,7 @@ import android.graphics.Matrix
 import android.graphics.RectF
 import android.os.Bundle
 import android.util.Log
-import android.util.Size
 import android.view.View
-import android.view.ViewGroup
 import android.view.ViewGroup.MarginLayoutParams
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.AspectRatio
@@ -192,10 +190,10 @@ class CameraActivity : AppCompatActivity() {
                 image.use { bitmapBuffer.copyPixelsFromBuffer(image.planes[0].buffer)  }
 
                 // Process the image in Tensorflow
-                val predictionLocation = segmentImage(bitmapBuffer.rotate(imageRotationDegrees))
+                val predictionLocation = segmentImage(bitmapBuffer)//.rotate(imageRotationDegrees))
 
                 // Report only the top prediction
-                reportPrediction(predictionLocation)
+                reportPrediction(predictionLocation, image.imageInfo.sensorToBufferTransformMatrix)
 
                 // Compute the FPS of the entire pipeline
                 val frameCount = 10
@@ -269,10 +267,10 @@ class CameraActivity : AppCompatActivity() {
 
                 if (contourPoints.size == 4) {
                     RectF(
-                        contourPoints[0].x.toFloat() / bitmap.width,
-                        contourPoints[0].y.toFloat() / bitmap.height,
-                        contourPoints[2].x.toFloat() / bitmap.width,
-                        contourPoints[2].y.toFloat() / bitmap.height,
+                        contourPoints[3].x.toFloat(),
+                        contourPoints[3].y.toFloat(),
+                        contourPoints[1].x.toFloat(),
+                        contourPoints[1].y.toFloat(),
                     )
                         .also {
                             Log.d("carlos", "contourPoints: $contourPoints ${bitmap.width} x ${bitmap.height}")
@@ -284,7 +282,8 @@ class CameraActivity : AppCompatActivity() {
     }
 
     private fun reportPrediction(
-        predictionLocation: RectF?
+        predictionLocation: RectF?,
+        sensorToBufferTransformMatrix: Matrix,
     ) = activityCameraBinding.viewFinder.post {
 
         // Early exit: if prediction is not good enough, don't report it
@@ -294,14 +293,12 @@ class CameraActivity : AppCompatActivity() {
         }
 
         // Location has to be mapped to our local coordinates
-        val location = mapOutputCoordinates(predictionLocation)
+        val location = mapOutputCoordinates(predictionLocation, sensorToBufferTransformMatrix)
 
         // Update the text and UI
         activityCameraBinding.boxPrediction.updateLayoutParams<MarginLayoutParams> {
             topMargin = location.top.toInt()
             leftMargin = location.left.toInt()
-//            bottomMargin = activityCameraBinding.viewFinder.height - location.bottom.toInt()
-//            rightMargin = activityCameraBinding.viewFinder.width - location.right.toInt()
             width = min(activityCameraBinding.viewFinder.width, location.right.toInt() - location.left.toInt())
             height = min(activityCameraBinding.viewFinder.height, location.bottom.toInt() - location.top.toInt())
         }
@@ -314,31 +311,22 @@ class CameraActivity : AppCompatActivity() {
      * Helper function used to map the coordinates for objects coming out of
      * the model into the coordinates that the user sees on the screen.
      */
-    private fun mapOutputCoordinates(location: RectF): RectF {
+    private fun mapOutputCoordinates(
+        location: RectF,
+        sensorToAnalysis: Matrix,
+    ): RectF {
+        val correctedLocation = RectF()
 
-        // Step 1: map location to the preview coordinates
-        val correctedLocation = RectF(
-            location.left * activityCameraBinding.viewFinder.width,
-            location.top * activityCameraBinding.viewFinder.height,
-            location.right * activityCameraBinding.viewFinder.width,
-            location.bottom * activityCameraBinding.viewFinder.height
-        )
+        // Location has to be mapped to our local coordinates
+        val sensorToView = activityCameraBinding.viewFinder.sensorToViewTransform ?: Matrix()
+        val analysisToView = Matrix()
+        sensorToAnalysis.invert(analysisToView)
+        analysisToView.postConcat(sensorToView)
+        analysisToView.mapRect(correctedLocation, location)
 
-        Log.d("carlos", "${activityCameraBinding.viewFinder.width} x ${activityCameraBinding.viewFinder.height}")
+        Log.d("carlos", "analysisToView: $location => $correctedLocation ${activityCameraBinding.viewFinder.width} x ${activityCameraBinding.viewFinder.height}")
 
-//        return correctedLocation
-
-        // Step 3: compensate for 1:1 to 4:3 aspect ratio conversion + small margin
-        val margin = 0.1f
-        val requestedRatio = 4f / 3f
-        val midX = (correctedLocation.left + correctedLocation.right) / 2f
-        val midY = (correctedLocation.top + correctedLocation.bottom) / 2f
-        return RectF(
-                midX - (1f + margin) * requestedRatio * correctedLocation.width() / 2f,
-                midY - (1f - margin) * correctedLocation.height() / 2f,
-                midX + (1f + margin) * requestedRatio * correctedLocation.width() / 2f,
-                midY + (1f - margin) * correctedLocation.height() / 2f
-            )
+        return correctedLocation
     }
 
     override fun onResume() {
